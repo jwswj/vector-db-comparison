@@ -120,33 +120,28 @@ function estimateTurbopuffer(scenario: UsageScenario): CostEstimate {
   };
 }
 
-// Pinecone pricing (Serverless, as of 2024)
-// - Free tier: 2GB storage, 1M reads/month, 2M writes/month
+// Pinecone pricing (Serverless, as of 2026)
+// See: https://www.pinecone.io/pricing/ and https://docs.pinecone.io/guides/costs/understanding-cost
 // - Standard: $50/month minimum
 // - Storage: $0.33/GB/month
 // - Read units: $16 per 1M RU
+//   - IMPORTANT: 1 RU per GB of namespace size per query (min 0.25 RU/query)
+//   - This means query cost scales with namespace size, not just query count
 // - Write units: $4 per 1M WU
 function estimatePinecone(scenario: UsageScenario): CostEstimate {
   const storage_gb = calculateStorageGB(scenario.vectors, scenario.dimensions);
 
-  // Free tier limits
-  const free_storage_gb = 2;
-  const free_reads = 1_000_000;
-  const free_writes = 2_000_000;
+  const storage_cost = storage_gb * 0.33;
 
-  const billable_storage = Math.max(0, storage_gb - free_storage_gb);
-  const billable_queries = Math.max(0, scenario.queries_per_month - free_reads);
-  const billable_writes = Math.max(0, scenario.writes_per_month - free_writes);
+  // Read units scale with namespace size: 1 RU per GB per query, min 0.25 RU
+  const ru_per_query = Math.max(Math.ceil(storage_gb), 1);
+  const total_ru = scenario.queries_per_month * ru_per_query;
+  const query_cost = (total_ru / 1_000_000) * 16; // $16/M RU
 
-  const storage_cost = billable_storage * 0.33;
-  const query_cost = (billable_queries / 1_000_000) * 16; // $16/M reads
-  const write_cost = (billable_writes / 1_000_000) * 4;   // $4/M writes
+  const write_cost = (scenario.writes_per_month / 1_000_000) * 4; // $4/M WU
 
   const usage_total = storage_cost + query_cost + write_cost;
-
-  // $50/month minimum for Standard plan (if exceeding free tier)
-  const exceeds_free_tier = billable_storage > 0 || billable_queries > 0 || billable_writes > 0;
-  const minimum_cost = exceeds_free_tier ? 50 : 0;
+  const minimum_cost = 50;
   const total = Math.max(usage_total, minimum_cost);
 
   return {
@@ -160,49 +155,55 @@ function estimatePinecone(scenario: UsageScenario): CostEstimate {
     minimum_cost,
     total_monthly_cost: total,
     notes: [
-      exceeds_free_tier ? "Standard plan ($50 min)" : "Free tier",
-      "Storage: $0.33/GB, Reads: $16/M, Writes: $4/M",
-      "Scales automatically",
+      "Standard plan ($50 min)",
+      `${ru_per_query} RU/query (1 RU per GB namespace)`,
+      "Storage: $0.33/GB, Reads: $16/M RU, Writes: $4/M WU",
     ],
   };
 }
 
-// Elasticsearch (Elastic Cloud Serverless, as of 2024)
-// - Pay-per-use with VCU (Virtual Compute Units)
-// - Search: $0.095/VCU-hour
-// - Ingest: $0.095/VCU-hour (shared with search)
-// - Storage: $0.047/GB/month (after 50GB free)
-// - Minimum ~2 VCU active = ~$140/month baseline
-// - IMPORTANT: Vector search uses "Vector Optimized" profile
-//   which consumes ~4x more VCUs than standard text search
+// Elasticsearch (Elastic Cloud Serverless, as of 2026)
+// See: https://www.elastic.co/pricing/serverless-search
+// - Search VCU: $0.09/VCU-hour
+// - Ingest VCU: $0.14/VCU-hour
+// - Storage: $0.047/GB/month (50GB free for vector profiles)
+// - Minimum ~2 VCU baseline
+// - Vector search uses "Vector Optimized" profile (~4x more VCUs than text)
+// - VCUs must hold HNSW index in memory (~8GB usable per VCU)
 function estimateElasticsearch(scenario: UsageScenario): CostEstimate {
   const storage_gb = calculateStorageGB(scenario.vectors, scenario.dimensions);
 
-  // 50GB free storage
   const free_storage_gb = 50;
   const billable_storage = Math.max(0, storage_gb - free_storage_gb);
   const storage_cost = billable_storage * 0.047;
 
   const hours_per_month = 24 * 30;
 
-  // Estimate VCU usage based on query volume
-  // Vector search is much more compute-intensive than text search
-  // Assuming ~2,500 vector queries/VCU-hour (4x less than text search)
-  // This is based on Elastic's "Vector Optimized" profile documentation
-  const queries_per_hour = scenario.queries_per_month / hours_per_month;
-  const query_vcus_needed = queries_per_hour / 2_500;
+  // HNSW index must fit in aggregate VCU memory for low-latency vector search
+  // Memory per vector: vector data + HNSW graph edges (M=16, ~256 bytes overhead)
+  const bytes_per_vector = scenario.dimensions * 4 + 256;
+  const index_memory_gb = (scenario.vectors * bytes_per_vector) / (1024 ** 3);
+  const gb_per_vcu = 8; // ~8GB usable memory per VCU
+  const data_driven_search_vcus = index_memory_gb / gb_per_vcu;
 
-  // Vector indexing is also more expensive (~10K writes/VCU-hour)
+  // Query-throughput-driven VCUs
+  const queries_per_hour = scenario.queries_per_month / hours_per_month;
+  const throughput_search_vcus = queries_per_hour / 2_500;
+
+  // Ingest VCUs
   const writes_per_hour = scenario.writes_per_month / hours_per_month;
   const write_vcus_needed = writes_per_hour / 10_000;
 
-  // Minimum 2 VCU baseline for serverless (always-on)
-  const min_vcus = 2;
-  const total_vcus = Math.max(query_vcus_needed + write_vcus_needed, min_vcus);
-  const total_vcu_hours = total_vcus * hours_per_month;
-  const min_vcu_hours = min_vcus * hours_per_month;
+  const min_search_vcus = 1;
+  const min_ingest_vcus = 1;
+  // Search VCUs: max of data-driven (index must fit) and throughput-driven
+  const search_vcus = Math.max(data_driven_search_vcus, throughput_search_vcus, min_search_vcus);
+  const ingest_vcus = Math.max(write_vcus_needed, min_ingest_vcus);
 
-  const compute_cost = total_vcu_hours * 0.095;
+  const search_cost = search_vcus * hours_per_month * 0.09;
+  const ingest_cost = ingest_vcus * hours_per_month * 0.14;
+  const compute_cost = search_cost + ingest_cost;
+  const min_compute = (min_search_vcus * 0.09 + min_ingest_vcus * 0.14) * hours_per_month;
 
   return {
     backend: "elastic",
@@ -212,38 +213,50 @@ function estimateElasticsearch(scenario: UsageScenario): CostEstimate {
     query_cost: 0,
     write_cost: 0,
     compute_cost,
-    minimum_cost: min_vcu_hours * 0.095, // ~$137
+    minimum_cost: min_compute,
     total_monthly_cost: storage_cost + compute_cost,
     notes: [
       "VCU-based serverless pricing",
-      "Vector search uses ~4x more VCUs than text",
-      "~$140/month minimum (2 VCU baseline)",
+      `~${Math.ceil(search_vcus)} search VCUs (index must fit in memory)`,
+      "Search: $0.09/VCU-hr, Ingest: $0.14/VCU-hr",
     ],
   };
 }
 
-// AWS OpenSearch Serverless (AOSS, as of 2024)
-// - Minimum 2 OCUs (OpenSearch Compute Units) = ~$175/month
+// AWS OpenSearch Serverless (AOSS, as of 2026)
+// See: https://aws.amazon.com/opensearch-service/pricing/
 // - $0.24/OCU-hour
 // - Storage: $0.024/GB/month
-// - Search OCU: handles queries
-// - Indexing OCU: handles writes
+// - Minimum 2 OCUs (1 search + 1 indexing) for production
+// - Each OCU provides ~6GB of memory for hot data
+// - HNSW vector indexes must fit in aggregate OCU memory
 function estimateOpenSearch(scenario: UsageScenario): CostEstimate {
   const storage_gb = calculateStorageGB(scenario.vectors, scenario.dimensions);
   const storage_cost = storage_gb * 0.024;
 
-  // Minimum 2 OCUs (1 search + 1 indexing) always running
-  const min_ocu = 2;
   const hours_per_month = 24 * 30;
 
-  // Scale OCUs based on load (rough estimate)
-  // 1 search OCU can handle ~10K queries/hour
-  const search_ocu = Math.max(1, scenario.queries_per_month / (10_000 * hours_per_month));
-  // 1 indexing OCU can handle ~50K writes/hour
+  // HNSW index must fit in aggregate OCU memory
+  // Memory per vector: vector data + HNSW graph edges (~256 bytes for M=16)
+  const bytes_per_vector = scenario.dimensions * 4 + 256;
+  const index_memory_gb = (scenario.vectors * bytes_per_vector) / (1024 ** 3);
+  const gb_per_ocu = 6; // ~6GB usable memory per search OCU
+  const data_driven_search_ocu = index_memory_gb / gb_per_ocu;
+
+  // Query-throughput-driven OCUs
+  const queries_per_hour = scenario.queries_per_month / hours_per_month;
+  const throughput_search_ocu = queries_per_hour / 10_000;
+
+  // Indexing OCUs
   const indexing_ocu = Math.max(1, scenario.writes_per_month / (50_000 * hours_per_month));
 
-  const total_ocu = Math.max(search_ocu + indexing_ocu, min_ocu);
-  const compute_cost = total_ocu * hours_per_month * 0.24;
+  // Search OCUs: max of data-driven and throughput-driven
+  const search_ocu = Math.max(data_driven_search_ocu, throughput_search_ocu, 1);
+  const total_ocu = search_ocu + indexing_ocu;
+  const min_ocu = 2;
+  const effective_ocu = Math.max(total_ocu, min_ocu);
+
+  const compute_cost = effective_ocu * hours_per_month * 0.24;
 
   return {
     backend: "opensearch",
@@ -253,63 +266,84 @@ function estimateOpenSearch(scenario: UsageScenario): CostEstimate {
     query_cost: 0,
     write_cost: 0,
     compute_cost,
-    minimum_cost: min_ocu * hours_per_month * 0.24, // ~$346
+    minimum_cost: min_ocu * hours_per_month * 0.24,
     total_monthly_cost: storage_cost + compute_cost,
     notes: [
       "OCU-based serverless pricing",
-      "Minimum 2 OCUs required (~$346/month)",
-      "High minimum for low-usage workloads",
+      `~${Math.ceil(search_ocu)} search OCUs (index must fit in memory)`,
+      "$0.24/OCU-hr, $0.024/GB storage",
     ],
   };
 }
 
-// Supabase/pgvector pricing (as of 2024)
-// - Free tier: 500MB storage, 2GB bandwidth
-// - Pro: $25/month, 8GB storage, 250GB bandwidth
-// - Team: $599/month, 100GB storage
-// - Pay-as-you-go storage: $0.125/GB/month (above included)
+// Supabase/pgvector pricing (as of 2026)
+// See: https://supabase.com/pricing and https://supabase.com/docs/guides/ai/choosing-compute-addon
+// - Pro: $25/month base, 8GB storage included
+// - Storage overage: $0.125/GB/month
+// - No per-query charges, but compute add-ons required for vector workloads
+// - Compute add-ons are the dominant cost for pgvector (HNSW needs RAM)
 function estimateSupabase(scenario: UsageScenario): CostEstimate {
   const storage_gb = calculateStorageGB(scenario.vectors, scenario.dimensions);
 
-  // Determine tier based on storage needs
-  let tier: "free" | "pro" | "team" = "free";
-  let base_cost = 0;
-  let included_storage = 0.5;
-
-  if (storage_gb > 0.5) {
-    tier = "pro";
-    base_cost = 25;
-    included_storage = 8;
-  }
-  if (storage_gb > 8) {
-    tier = "team";
-    base_cost = 599;
-    included_storage = 100;
-  }
+  // Pro plan base
+  const base_cost = 25;
+  const included_storage = 8;
 
   const extra_storage = Math.max(0, storage_gb - included_storage);
   const storage_cost = extra_storage * 0.125;
 
-  // Supabase doesn't charge per query (within compute limits)
-  // Large query volumes may need compute upgrades
-  const query_cost = 0;
-  const write_cost = 0;
+  // Compute add-on based on vector count (HNSW index must fit in RAM)
+  // Tiers from https://supabase.com/docs/guides/ai/choosing-compute-addon
+  const compute_tiers = [
+    { name: "Micro",  maxVectors384: 100_000,   maxVectors1536: 15_000,    cost: 10 },
+    { name: "Small",  maxVectors384: 250_000,   maxVectors1536: 50_000,    cost: 15 },
+    { name: "Medium", maxVectors384: 500_000,   maxVectors1536: 100_000,   cost: 60 },
+    { name: "Large",  maxVectors384: 1_000_000, maxVectors1536: 224_000,   cost: 110 },
+    { name: "XL",     maxVectors384: 2_000_000, maxVectors1536: 500_000,   cost: 210 },
+    { name: "2XL",    maxVectors384: 4_000_000, maxVectors1536: 1_000_000, cost: 410 },
+    { name: "4XL",    maxVectors384: 8_000_000, maxVectors1536: 2_000_000, cost: 960 },
+    { name: "8XL",    maxVectors384: 16_000_000, maxVectors1536: 4_000_000, cost: 1870 },
+    { name: "12XL",   maxVectors384: 24_000_000, maxVectors1536: 6_000_000, cost: 2800 },
+    { name: "16XL",   maxVectors384: 32_000_000, maxVectors1536: 8_000_000, cost: 3730 },
+  ];
+
+  // Interpolate max vectors based on dimensions (384 and 1536 are reference points)
+  const dimRatio = Math.min(1, Math.max(0, (scenario.dimensions - 384) / (1536 - 384)));
+
+  let compute_cost = 0;
+  let tier_name = "Micro";
+
+  const matchedTier = compute_tiers.find(t => {
+    const maxVectors = Math.round(t.maxVectors384 + (t.maxVectors1536 - t.maxVectors384) * dimRatio);
+    return scenario.vectors <= maxVectors;
+  });
+
+  if (matchedTier) {
+    compute_cost = matchedTier.cost;
+    tier_name = matchedTier.name;
+  } else {
+    // Exceeds largest tier — extrapolate linearly from 16XL
+    const largest = compute_tiers[compute_tiers.length - 1];
+    const maxVectors = Math.round(largest.maxVectors384 + (largest.maxVectors1536 - largest.maxVectors384) * dimRatio);
+    const multiplier = Math.ceil(scenario.vectors / maxVectors);
+    compute_cost = largest.cost * multiplier;
+    tier_name = `${multiplier}x 16XL`;
+  }
 
   return {
     backend: "supabase",
     scenario: scenario.name,
     storage_gb,
     storage_cost,
-    query_cost,
-    write_cost,
-    compute_cost: 0,
+    query_cost: 0,
+    write_cost: 0,
+    compute_cost,
     minimum_cost: base_cost,
-    total_monthly_cost: base_cost + storage_cost,
+    total_monthly_cost: base_cost + storage_cost + compute_cost,
     notes: [
-      `${tier.charAt(0).toUpperCase() + tier.slice(1)} tier`,
-      tier === "free" ? "500MB storage included" : tier === "pro" ? "8GB storage included" : "100GB storage included",
-      "No per-query charges",
-      "Limited by compute (may need upgrades for high QPS)",
+      `Pro + ${tier_name} compute ($${compute_cost}/mo)`,
+      "No per-query charges (compute-bound)",
+      "Storage: $0.125/GB over 8GB included",
     ],
   };
 }
@@ -340,7 +374,7 @@ export function printCostComparison(scenarios: UsageScenario[] = SCENARIOS): voi
   console.log("Cost Comparison by Scenario");
   console.log("===========================");
   console.log("");
-  console.log("Note: Costs are estimates based on public pricing as of 2024.");
+  console.log("Note: Costs are estimates based on public pricing as of Feb 2026.");
   console.log("Actual costs may vary based on usage patterns, region, and promotions.");
   console.log("");
 
@@ -379,7 +413,7 @@ export function generateCostReport(): object {
     }>;
   } = {
     generated_at: new Date().toISOString(),
-    pricing_version: "2024-01",
+    pricing_version: "2026-02",
     scenarios: [],
   };
 
