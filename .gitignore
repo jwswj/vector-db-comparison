@@ -1,0 +1,14 @@
+node_modules/
+dist/
+data/
+bin/
+.hermit/
+*.cursor
+.DS_Store
+.env
+.env.*
+.envrc
+notebooks/
+.claude/
+.mise.toml
+*.zip
